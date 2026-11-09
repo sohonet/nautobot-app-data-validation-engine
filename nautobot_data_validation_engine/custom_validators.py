@@ -191,8 +191,36 @@ def get_data_compliance_rules_map():
     return compliance_rulesets
 
 
+# (repo pk, commit) -> DataComplianceRule classes loaded from that commit.
+# get_classes_from_git_repo runs inside CustomValidator.clean(), i.e. on every
+# validated_save() of every model. Without this cache each save re-checked the
+# git working tree and deleted + re-imported the custom_validators modules from
+# disk under _IMPORT_LOCK: ~4ms CPU per save (3x the rest of validation) and a
+# process-wide serialisation point for bulk jobs such as the Nornir interface
+# SSoT. The code at a given commit never changes, so loading it once per commit
+# is equivalent; a repo sync moves current_head and therefore misses the cache.
+_GIT_CLASS_CACHE = {}
+
+
 def get_classes_from_git_repo(repo: GitRepository):
     """Get list of DataComplianceRule classes found within the custom_validators folder of the given repo."""
+    cache_key = (repo.pk, repo.current_head) if repo.current_head else None
+    if cache_key is not None:
+        cached = _GIT_CLASS_CACHE.get(cache_key)
+        if cached is not None:
+            return list(cached)
+    classes = _load_classes_from_git_repo(repo)
+    if cache_key is not None:
+        with _IMPORT_LOCK:
+            # Keep only the current commit per repo.
+            for key in [k for k in _GIT_CLASS_CACHE if k[0] == repo.pk]:
+                del _GIT_CLASS_CACHE[key]
+            _GIT_CLASS_CACHE[cache_key] = tuple(classes)
+    return classes
+
+
+def _load_classes_from_git_repo(repo: GitRepository):
+    """Check out the repo at its current head and import its custom_validators modules."""
     ensure_git_repository(repo, head=repo.current_head)
     class_list = []
     with _IMPORT_LOCK:
